@@ -11,9 +11,9 @@ def main(model_name, load_model, town, fps, im_width, im_height, repeat_action, 
          enable_preview, steps_per_episode, seed=7, action_type='continuous'):
 
     env = CarlaEnv(town, fps, im_width, im_height, repeat_action, start_transform_type, sensors,
-                   action_type, enable_preview, steps_per_episode, playing=False)
-    test_env = CarlaEnv(town, fps, im_width, im_height, repeat_action, start_transform_type, sensors,
-                   action_type, enable_preview=True, steps_per_episode=steps_per_episode, playing=True)
+                   action_type, enable_preview=True, steps_per_episode=steps_per_episode, playing=False)
+    #test_env = CarlaEnv(town, fps, im_width, im_height, repeat_action, start_transform_type, sensors,
+    #               action_type, enable_preview=True, steps_per_episode=steps_per_episode, playing=True)
 
     try:
         if load_model:
@@ -29,27 +29,26 @@ def main(model_name, load_model, town, fps, im_width, im_height, repeat_action, 
                 seed=seed, 
                 device='cuda', 
                 tensorboard_log='./sem_sac',
-                action_noise=NormalActionNoise(mean=np.array([0.3, 0]), sigma=np.array([0.5, 0.1]))
+                action_noise=NormalActionNoise(mean=np.array([0.3, 0.0, 0.0]), sigma=np.array([0.5, 0.5, 0.1])),
+                buffer_size=100000,
+                batch_size=256
                 )
         print(model.__dict__)
         model.learn(
             total_timesteps=10000, 
-            log_interval=4, 
+            log_interval=10, 
             tb_log_name=model_name, 
-            eval_env=test_env, 
-            eval_freq=1000, 
-            n_eval_episodes=10
+            progress_bar=True 
             )
         model.save(model_name)
     finally:
         env.close()
-        test_env.close()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model-name', help='name of model when saving')
     parser.add_argument('--load', type=bool, help='whether to load existing model')
-    parser.add_argument('--map', type=str, default='Town04', help='name of carla map')
+    parser.add_argument('--map', type=str, default='Town02', help='name of carla map')
     parser.add_argument('--fps', type=int, default=10, help='fps of carla env')
     parser.add_argument('--width', type=int, help='width of camera observations')
     parser.add_argument('--height', type=int, help='height of camera observations')

@@ -29,7 +29,7 @@ class CarlaEnv(gym.Env):
                  action_type, enable_preview, steps_per_episode, playing=False, timeout=60):
 
         try:
-            client = carla.Client("localhost", 2000)  
+            client = carla.Client("192.168.0.10", 2000)  
             client.set_timeout(100.0)
 
             client.load_world(map_name=town)
@@ -43,10 +43,10 @@ class CarlaEnv(gym.Env):
         except RuntimeError as msg:
             pass
 
-        self.server = self.get_pid("CarlaUE4-Linux-Shipping")    
+        #self.server = self.get_pid("CarlaUE4-Linux-Shipping")
         self.map = self.world.get_map()
         blueprint_library = self.world.get_blueprint_library()
-        self.tesla = blueprint_library.filter('tesla')[0]
+        self.tesla = blueprint_library.filter('model3')[0]
         self.img_width = img_width
         self.img_height = img_height
         self.repeat_action = repeat_action
@@ -108,7 +108,7 @@ class CarlaEnv(gym.Env):
                 break
             except Exception as e:
                 logging.error('Error carla 141 {}'.format(str(e)))
-                time.sleep(0.01)
+                time.sleep(0.05)
 
             # If that can't be done in 3 seconds - forgive (and allow main process to handle for this problem)
             if time.time() > spawn_start + 3:
@@ -202,7 +202,11 @@ class CarlaEnv(gym.Env):
         self.frame_step += 1
 
         # Apply control to the vehicle based on an action
-        self.vehicle.apply_control(self.actions.action_to_control(action))
+        control = carla.VehicleControl()
+        control.throttle = min(1.0, max(0.0, action[0].item()))
+        control.brake = min(1.0, max(0.0, action[1].item()))
+        control.steer = min(1.0, max(-1, action[2].item()))
+        self.vehicle.apply_control(control)
 
         # Calculate speed in km/h from car's velocity (3D vector)
         v = self.vehicle.get_velocity()
@@ -259,12 +263,12 @@ class CarlaEnv(gym.Env):
         if self.frame_step >= self.steps_per_episode:
             done = True
 
-        if not self._on_highway():
-            self.out_of_loop += 1
-            if self.out_of_loop >= 20:
-                done = True
-        else:
-            self.out_of_loop = 0
+        #if not self._on_highway():
+        #    self.out_of_loop += 1
+        #    if self.out_of_loop >= 20:
+        #        done = True
+        #else:
+        #    self.out_of_loop = 0
 
         # self.total_reward += reward
 
@@ -272,7 +276,7 @@ class CarlaEnv(gym.Env):
             # info['episode'] = {}
             # info['episode']['l'] = self.frame_step
             # info['episode']['r'] = reward
-            logging.debug("Env lasts {} steps, restarting ... ".format(self.frame_step))
+            logging.warn("Env lasts {} steps, restarting ... ".format(self.frame_step))
             self._destroy_agents()
         
         return image, reward, done, info
@@ -292,8 +296,8 @@ class CarlaEnv(gym.Env):
         if self.preview_camera_enabled:
 
             self._display, self._clock, self._font = carla_utils.graphics.setup(
-                width=400,
-                height=400,
+                width=800,
+                height=600,
                 render=True,
             )
             mode = 'human'

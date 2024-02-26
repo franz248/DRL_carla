@@ -40,9 +40,9 @@ class CarlaActions():
             control.steer = action[1]
 
         elif self.action_type == 'continuous':
-            control.throttle = min(1, max(0.0, action[0]))
-            control.brake = min(1, max(0.0, action[1]))
-            control.steer = min(1, max(-1, action[2]))
+            control.throttle = min(1.0, max(0.0, action[0]))
+            control.brake = min(1.0, max(0.0, action[1]))
+            control.steer = min(1.0, max(-1, action[2]))
 
         # print('Control: {}, {}, {}'.format(control.throttle, control.brake, control.steer))
         return control
