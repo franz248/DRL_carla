@@ -1,6 +1,3 @@
-import os
-import signal
-import sys
 import carla
 import gym
 import time
@@ -10,11 +7,11 @@ import math
 from queue import Queue
 from gym import spaces
 from absl import logging
-import carla_utils.graphics
 import pygame
-import atexit
-from subprocess import check_output
 
+
+from carla_utils.graphics import HUD
+from carla_utils.utils import get_actor_display_name, smooth_action
 from core_rl.actions import CarlaActions
 from core_rl.observation import CarlaObservations
 
@@ -25,94 +22,107 @@ class CarlaEnv(gym.Env):
 
     metadata = {'render.modes': ['human']}
 
-    def __init__(self, town, fps, img_width, img_height, repeat_action, start_transform_type, sensors,
-                 action_type, enable_preview, steps_per_episode, playing=False, timeout=60):
+    def __init__(self, town, fps, obs_width, obs_height, view_height, view_width, repeat_action, sensors,
+                 action_type, enable_preview, steps_per_episode, playing=False, allow_render=True, allow_spectator=True):
+
+        self.obs_height = obs_height
+        self.obs_width = obs_width
+        self.spectator_height = view_height
+        self.spectator_width = view_width
+        self.allow_render = allow_render
+        self.allow_spectator = allow_spectator
+        self.spectator_camera = None
+        self.tesla = blueprint_library.filter('model3')[0]
+        self.episode_idx = -2
+        self.world = None
+        self.actions = CarlaActions()
+        self.observations = CarlaObservations(self.obs_height, self.obs_width)
+
+        self.action_space = self.actions.get_action_space()
+        self.observation_space = self.observations.get_observation_space()
 
         try:
-            client = carla.Client("192.168.0.10", 2000)  
-            client.set_timeout(100.0)
+            self.client = carla.Client("192.168.0.10", 2000)  
+            self.client.set_timeout(100.0)
 
-            client.load_world(map_name=town)
-            self.world = client.get_world()
+            self.client.load_world(map_name=town)
+            self.world = self.client.get_world()
             self.world.set_weather(carla.WeatherParameters.ClearNoon)  
-            frame = self.world.apply_settings(
+            self.world.apply_settings(
                 carla.WorldSettings(  
                     synchronous_mode=True,
                     fixed_delta_seconds=1.0 / fps,
                 ))
+            self.client.reload_world(False)  # reload map keeping the world settings
+
+            # Spawn Vehicle
+            self.start_transform = self._get_start_transform()
+            self.curr_loc = self.start_transform.location
+            self.vehicle = self.world.spawn_actor(self.tesla, self.start_transform)
+
+           # Spawn collision and invasion sensors
+            colsensor = self.world.get_blueprint_library().find('sensor.other.collision')
+            lanesensor = self.world.get_blueprint_library().find('sensor.other.lane_invasion')
+            self.colsensor = self.world.spawn_actor(colsensor, carla.Transform(), attach_to=self.vehicle)
+            self.lanesensor = self.world.spawn_actor(lanesensor, carla.Transform(), attach_to=self.vehicle)
+            self.colsensor.listen(self._collision_data)
+            self.lanesensor.listen(self._lane_invasion_data)  
+
+            # Create hud and initialize pygame for visualization
+            if self.allow_render:
+                pygame.init()
+                pygame.font.init()
+                self.display = pygame.display.set_mode((self.spectator_width, self.spectator_height), pygame.HWSURFACE | pygame.DOUBLEBUF)
+                self.clock = pygame.time.Clock()
+                self.hud = HUD(self.spectator_width, self.spectator_height)
+                self.hud.set_vehicle(self.vehicle)
+                self.world.on_tick(self.hud.on_world_tick)
+
+            # Set observation image
+                      
+ 
+            # Set spectator cam   
+            if self.allow_spectator:
+                self.spectator_camera = self.world.get_blueprint_library().find('sensor.camera.rgb')
+                self.spectator_camera.set_attribute('image_size_x', '800')
+                self.spectator_camera.set_attribute('image_size_y', '800')
+                self.spectator_camera.set_attribute('fov', '100')
+                transform = carla.Transform(carla.Location(x=-5.5, z=2.5), carla.Rotation(pitch=8.0))
+                self.spectator_sensor = self.world.spawn_actor(self.spectator_camera, transform, attach_to=self.vehicle, attachment_type=carla.AttachmentType.SpringArm)
+                self.spectator_sensor.listen(self.spectator_image_Queue.put)
+                    
         except RuntimeError as msg:
             pass
 
         #self.server = self.get_pid("CarlaUE4-Linux-Shipping")
         self.map = self.world.get_map()
         blueprint_library = self.world.get_blueprint_library()
-        self.tesla = blueprint_library.filter('model3')[0]
-        self.img_width = img_width
-        self.img_height = img_height
+        
+        self.obs_width = obs_width
+        self.obs_height = obs_height
         self.repeat_action = repeat_action
-        self.start_transform_type = start_transform_type
         self.sensors = sensors
         self.actor_list = []
-        self.preview_camera = None
+        
         self.steps_per_episode = steps_per_episode
         self.playing = playing
         self.preview_camera_enabled = enable_preview
-        self.observation = CarlaObservations(img_height, img_width)
-        self.actions = CarlaActions(action_type)
 
-    @property
-    def observation_space(self, *args, **kwargs):
-        """Returns the observation space of the sensor."""
-        return self.observation.get_observation_space()
-
-    @property
-    def action_space(self):
-        """Returns the expected action passed to the `step` method."""
-        return self.actions.get_action_space()
-
-
-    def seed(self, seed):
-        if not seed:
-            seed = 7
-        random.seed(seed)
-        self._np_random = np.random.RandomState(seed) 
-        return seed
 
     # Resets environment for new episode
     def reset(self):
-        self._destroy_agents()
         # logging.debug("Resetting environment")
         # Car, sensors, etc. We create them every episode then destroy
-        self.collision_hist = []
-        self.lane_invasion_hist = []
-        self.actor_list = []
+        self.episode_idx += 1
+        self.terminate = False
+        self.extra_info = []  # List of extra info shown on the HUD
+        self.observation = self.observation_buffer = None  # Last received observation
+        self.viewer_image = self.viewer_image_buffer = None  # Last received image to show in the viewer
         self.frame_step = 0
         self.out_of_loop = 0
         self.dist_from_start = 0
-        # self.total_reward = 0
-
-        self.front_image_Queue = Queue()
-        self.preview_image_Queue = Queue()
 
         # self.episode += 1
-
-        # When Carla breaks (stopps working) or spawn point is already occupied, spawning a car throws an exception
-        # We allow it to try for 3 seconds then forgive
-        spawn_start = time.time()
-        while True:
-            try:
-                # Get random spot from a list from predefined spots and try to spawn a car there
-                self.start_transform = self._get_start_transform()
-                self.curr_loc = self.start_transform.location
-                self.vehicle = self.world.spawn_actor(self.tesla, self.start_transform)
-                break
-            except Exception as e:
-                logging.error('Error carla 141 {}'.format(str(e)))
-                time.sleep(0.05)
-
-            # If that can't be done in 3 seconds - forgive (and allow main process to handle for this problem)
-            if time.time() > spawn_start + 3:
-                raise Exception('Can\'t spawn a car')
 
         # Append actor to a list of spawned actors, we need to remove them later
         self.actor_list.append(self.vehicle)
@@ -125,8 +135,8 @@ class CarlaEnv(gym.Env):
         else:
             raise NotImplementedError('unknown sensor type')
 
-        self.rgb_cam.set_attribute('image_size_x', f'{self.img_width}')
-        self.rgb_cam.set_attribute('image_size_y', f'{self.img_height}')
+        self.rgb_cam.set_attribute('image_size_x', f'{self.obs_width}')
+        self.rgb_cam.set_attribute('image_size_y', f'{self.obs_height}')
         self.rgb_cam.set_attribute('fov', '90')
 
         bound_x = self.vehicle.bounding_box.extent.x
@@ -141,57 +151,32 @@ class CarlaEnv(gym.Env):
         # Preview ("above the car") camera
         if self.preview_camera_enabled:
             # TODO: add the configs
-            self.preview_cam = self.world.get_blueprint_library().find('sensor.camera.rgb')
-            self.preview_cam.set_attribute('image_size_x', '400')
-            self.preview_cam.set_attribute('image_size_y', '400')
-            self.preview_cam.set_attribute('fov', '100')
-            transform = carla.Transform(carla.Location(x=-5.5, z=2.5), carla.Rotation(pitch=8.0))
-            self.preview_sensor = self.world.spawn_actor(self.preview_cam, transform, attach_to=self.vehicle, attachment_type=carla.AttachmentType.SpringArm)
+            
             self.preview_sensor.listen(self.preview_image_Queue.put)
             self.actor_list.append(self.preview_sensor)
-
-        # Here's some workarounds.
-        self.vehicle.apply_control(carla.VehicleControl(throttle=1.0, brake=1.0))
-        time.sleep(4)
-
-        # Collision history is a list callback is going to append to (we brake simulation on a collision)
-        self.collision_hist = []
-        self.lane_invasion_hist = []
-
-        colsensor = self.world.get_blueprint_library().find('sensor.other.collision')
-        lanesensor = self.world.get_blueprint_library().find('sensor.other.lane_invasion')
-        self.colsensor = self.world.spawn_actor(colsensor, carla.Transform(), attach_to=self.vehicle)
-        self.lanesensor = self.world.spawn_actor(lanesensor, carla.Transform(), attach_to=self.vehicle)
-        self.colsensor.listen(self._collision_data)
-        self.lanesensor.listen(self._lane_invasion_data)
-        self.actor_list.append(self.colsensor)
-        self.actor_list.append(self.lanesensor)
-
-        self.world.tick()
-
-        # Wait for a camera to send first image (important at the beginning of first episode)
-        while self.front_image_Queue.empty():
-            logging.debug("waiting for camera to be ready")
-            time.sleep(0.01)
-            self.world.tick()
 
         # Disengage brakes
         self.vehicle.apply_control(carla.VehicleControl(brake=0.0))
 
         image = self.front_image_Queue.get()
         image = np.array(image.raw_data)
-        image = image.reshape((self.img_height, self.img_width, -1))
+        image = image.reshape((self.obs_height, self.obs_width, -1))
         image = image[:, :, :3]
+
+        self.world.tick()
+        # Return initial observation
+        time.sleep(0.2)
+        obs = self.step(None)[0]
+        time.sleep(0.2)
+        return obs
 
         return image
 
     def step(self, action):
         total_reward = 0
-        for _ in range(self.repeat_action):
-            obs, rew, done, info = self._step(action)
-            total_reward += rew
-            if done:
-                break
+        obs, rew, done, info = self._step(action)
+        total_reward += rew
+
         return obs, total_reward, done, info
 
     # Steps environment
@@ -200,7 +185,7 @@ class CarlaEnv(gym.Env):
         self.render()
             
         self.frame_step += 1
-
+        print(action)
         # Apply control to the vehicle based on an action
         control = carla.VehicleControl()
         control.throttle = min(1.0, max(0.0, action[0].item()))
@@ -219,7 +204,7 @@ class CarlaEnv(gym.Env):
 
         image = self.front_image_Queue.get()
         image = np.array(image.raw_data)
-        image = image.reshape((self.img_height, self.img_width, -1))
+        image = image.reshape((self.obs_height, self.obs_width, -1))
 
         # TODO: Combine the sensors
         if 'rgb' in self.sensors:
@@ -289,34 +274,45 @@ class CarlaEnv(gym.Env):
         '''
         pass
     
-    def render(self):
-        # TODO: clean this
-        # TODO: change the width and height to compat with the preview cam config
-
-        if self.preview_camera_enabled:
-
-            self._display, self._clock, self._font = carla_utils.graphics.setup(
-                width=800,
-                height=600,
-                render=True,
-            )
-            mode = 'human'
-            preview_img = self.preview_image_Queue.get()
-            preview_img = np.array(preview_img.raw_data)
-            preview_img = preview_img.reshape((400, 400, -1))
-            preview_img = preview_img[:, :, :3]
-            carla_utils.graphics.make_dashboard(
-                display=self._display,
-                font=self._font,
-                clock=self._clock,
-                observations={"preview_camera":preview_img},
-            )
-
-            if mode == "human":
-                # Update window display.
-                pygame.display.flip()
-            else:
-                raise NotImplementedError()
+    def render(self, mode="human"):
+ 
+       # Tick render clock
+       self.clock.tick()
+       self.hud.tick(self.world, self.clock)
+  
+       # Add metrics to HUD
+       self.extra_info.extend([
+           "Episode {}".format(self.episode_idx),
+           "Reward: % 19.2f" % self.last_reward,
+           "",
+           "Maneuver:        % 11s" % maneuver,
+           "Routes completed:    % 7.2f" % self.routes_completed,
+           "Distance traveled: % 7d m" % self.distance_traveled,
+           "Center deviance:   % 7.2f m" % self.distance_from_center,
+           "Avg center dev:    % 7.2f m" % (self.center_lane_deviation / self.step_count),
+           "Avg speed:      % 7.2f km/h" % (self.speed_accum / self.step_count),
+           "Total reward:        % 7.2f" % self.total_reward,
+       ])
+       if self.allow_spectator:
+           # Blit image from spectator camera
+           self.viewer_image = self._draw_path(self.camera, self.viewer_image)
+           self.display.blit(pygame.surfarray.make_surface(self.viewer_image.swapaxes(0, 1)), (0, 0))
+           # Superimpose current observation into top-right corner
+       obs_h, obs_w = self.observation.shape[:2]
+       pos_observation = (self.display.get_size()[0] - obs_w - 10, 10)
+       self.display.blit(pygame.surfarray.make_surface(self.observation.swapaxes(0, 1)), pos_observation)
+       pos_vae_decoded = (self.display.get_size()[0] - 2 * obs_w - 10, 10)
+       if self.decode_vae_fn:
+           self.display.blit(pygame.surfarray.make_surface(self.observation_decoded.swapaxes(0, 1)), pos_vae_decoded)
+       if self.activate_lidar:
+           lidar_h, lidar_w = self.lidar_data.shape[:2]
+           pos_lidar = (self.display.get_size()[0] - obs_w - 10, 100)
+           self.display.blit(pygame.surfarray.make_surface(self.lidar_data.swapaxes(0, 1)), pos_lidar)
+       # Render HUD
+       self.hud.render(self.display, extra_info=self.extra_info)
+       self.extra_info = []  # Reset extra info list
+       # Render to screen
+       pygame.display.flip()
 
     def _destroy_agents(self):
 
@@ -335,46 +331,38 @@ class CarlaEnv(gym.Env):
     def _collision_data(self, event):
 
         # What we collided with and what was the impulse
-        collision_actor_id = event.other_actor.type_id
-        collision_impulse = math.sqrt(event.normal_impulse.x ** 2 + event.normal_impulse.y ** 2 + event.normal_impulse.z ** 2)
+        if get_actor_display_name(event.other_actor) != "Road":
+            self.terminate = True
+        if self.allow_render:
+            self.hud.notification("Collision with {}".format(get_actor_display_name(event.other_actor)))
 
-        # # Filter collisions
-        # for actor_id, impulse in COLLISION_FILTER:
-        #     if actor_id in collision_actor_id and (impulse == -1 or collision_impulse <= impulse):
-        #         return
+        #collision_impulse = math.sqrt(event.normal_impulse.x ** 2 + event.normal_impulse.y ** 2 + event.normal_impulse.z ** 2)
 
-        # Add collision
-        self.collision_hist.append(event)
-    
+        
     def _lane_invasion_data(self, event):
-        # Change this function to filter lane invasions
-        self.lane_invasion_hist.append(event)
 
-    def _on_highway(self):
-        goal_abs_lane_id = 4
-        vehicle_waypoint_closest_to_road = \
-            self.map.get_waypoint(self.vehicle.get_location(), project_to_road=True, lane_type=carla.LaneType.Driving)
-        road_id = vehicle_waypoint_closest_to_road.road_id
-        lane_id_sign = int(np.sign(vehicle_waypoint_closest_to_road.lane_id))
-        assert lane_id_sign in [-1, 1]
-        goal_lane_id = goal_abs_lane_id * lane_id_sign
-        vehicle_s = vehicle_waypoint_closest_to_road.s
-        goal_waypoint = self.map.get_waypoint_xodr(road_id, goal_lane_id, vehicle_s)
-        return not (goal_waypoint is None)
+        self.terminate = True
+        lane_types = set(x.type for x in event.crossed_lane_markings)
+        text = ["%r" % str(x).split()[-1] for x in lane_types]
+        if self.allow_render:
+            self.hud.notification("Crossed line %s" % " and ".join(text))
+
+    def _get_observation(self):
+        while self.observation_buffer is None:
+            pass
+        obs = self.observation_buffer.copy()
+        self.observation_buffer = None
+        return obs
+
+    def _get_viewer_image(self):
+        while self.viewer_image_buffer is None:
+            pass
+        image = self.viewer_image_buffer.copy()
+        self.viewer_image_buffer = None
+        return image
 
     def _get_start_transform(self):
-        if self.start_transform_type == 'random':
-            return random.choice(self.map.get_spawn_points())
-        if self.start_transform_type == 'highway':
-            if self.map.name == "Town04":
-                for trial in range(10):
-                    start_transform = random.choice(self.map.get_spawn_points())
-                    start_waypoint = self.map.get_waypoint(start_transform.location)
-                    if start_waypoint.road_id in list(range(35, 50)): # TODO: change this
-                        break
-                return start_transform
-            else:
-                raise NotImplementedError
+        return random.choice(self.map.get_spawn_points())    
             
-    def get_pid(self, name):
-        return int(check_output(["pidof", "-s", name]))        
+    
+        
